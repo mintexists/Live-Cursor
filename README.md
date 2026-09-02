@@ -1,80 +1,128 @@
 # Live Cursor for Obsidian
 
-Live Cursor is an ultra-lightweight, zero-conflict real-time collaborative editing and configuration sync engine for Obsidian vaults. It brings real-time collaborative editing, live collaborator cursor tracking, and total vault synchronization across devices without complex setups.
+**Status: Early Development**
+
+Live Cursor is currently under active development and **has not been published** to the Obsidian community plugin catalog yet. Expect bugs, missing features, and breaking changes between releases. If you find a problem, please open an issue — reports like yours are what make this project better.
+
+Live Cursor is a lightweight real-time collaborative editing and configuration sync engine for Obsidian vaults. It brings real-time collaborative editing, live collaborator cursor tracking, and vault synchronization across devices without complex setups.
 
 ---
 
-## Architecture & Connection Modes
+## What Works Today
 
-Live Cursor is built with **Simplicity** in mind. We know setting up sync servers can be painful, so we’ve abstracted the technology into three seamless Connection Modes. Whether you are working across the room, across a corporate VPN, or from your mobile phone on a train, Live Cursor just works.
+- **Real-Time Cursor Tracking**: View the live cursors and text selections of other editors inside your notes, with custom user profiles and colors.
+- **Collaborative Editing**: Open the same note on multiple devices and edit together in real time, powered by Yjs CRDTs.
+- **Config Sync Engine**: Bidirectional synchronization of settings, themes, snippets, and other files in your vault. Handles conflicts by automatically merging notes (CRDT) and JSON configs (deep merge), with a last-modified-wins fallback for other files.
+- **Local Host Mode (Desktop)**: One click starts a private Node.js sync server on your PC for devices on the same network (or a Tailscale/ZeroTier VPN).
+- **Cloud Server Mode**: Deploy the included server on any VPS or Raspberry Pi for always-on sync.
 
-### 1. Host Local (LAN/Tailscale) 
+## What's In Development
+
+- **WebRTC P2P Mode (Mobile)**: Peer-to-peer sync without a central server is planned but not implemented yet. The README used to claim this feature — it does not exist in the code today. This is the next big piece of work.
+- **Plugin Catalog Submission**: Submission to the official Obsidian community plugin catalog will happen once the plugin reaches a more stable state.
+- **Admin diagnostics dashboard**: Planned for dedicated cloud instances.
+
+---
+
+## Connection Modes
+
+### 1. Local Host (LAN/VPN)
+
 **Best for:** Desktop users who want a quick, private sync session with other computers on their Wi-Fi or VPN.
 
-- **How it works:** When you click "Start Local Host" on a Desktop PC, Live Cursor silently spins up a lightweight Node.js background websocket daemon. It automatically scans your network interfaces and gives you ready-to-use IP addresses (e.g., `ws://192.168.x.x:1234/sync`).
+- **How it works:** When you click "Start Local Server" in settings on a desktop PC, Live Cursor silently spins up a lightweight Node.js WebSocket daemon in the background. It listens on port `4444`.
 - **Simplicity:** No terminals, no Docker, no configuration files. One click and your PC is the server.
-- **Limitations:** Only works on Desktop OS (Windows, Mac, Linux). Mobile devices (iOS/Android) cannot act as the "Host" in this mode because mobile operating systems block background TCP port binding. Mobile devices **can** easily join this host, but they cannot *be* the host.
+- **Limitations:** Only works on desktop OS (Windows, Mac, Linux). Mobile devices (iOS/Android) cannot act as the host in this mode because mobile operating systems block background TCP port binding. Mobile devices can join a desktop host, but they cannot be the host.
 
-### 2. WebRTC P2P (Mobile Friendly)
-**Best for:** Mobile users, serverless setups, and true Peer-to-Peer synchronization.
+### 2. Cloud Server
 
-- **How it works:** This mode uses a decentralized WebRTC mesh network powered by `y-webrtc`. Instead of a central server, devices connect directly to each other using a shared "Room Name" and "Password".
-- **Serverless Vault Config Sync:** Usually, syncing your `.obsidian` configuration files (themes, plugins) requires an HTTP server. Live Cursor elegantly bypasses this limitation on Mobile by pushing your configuration files directly over WebRTC Data Channels using a shared `Y.Map`. **This means your mobile phone can fully act as a "Server" for configurations and real-time editing without needing a Node.js daemon.**
-- **Simplicity:** Enter a Room Name, and you are instantly syncing. No IPs, no port forwarding.
-- **Limitations:** Requires an active internet connection to briefly hit public WebRTC signaling servers (which only facilitate the initial peer handshake, not the data itself).
+**Best for:** Always-on sync across the internet, 24/7, without keeping a PC running.
 
-### 3. Cloud Server 
-**Best for:** Enterprise teams, 24/7 always-on sync environments, and heavy multi-user collaboration.
+- **How it works:** You deploy the server (via Docker or Node) on a dedicated VPS (like DigitalOcean, AWS, or a Raspberry Pi). You then point your Live Cursor settings to that `ws://` URL.
+- **Simplicity:** The repository includes a `Dockerfile`. Build and run it, set the `AUTH_TOKEN` environment variable to a strong password, and point your devices at it.
+- **Limitations:** Requires a machine that is always on, and some technical knowledge (DNS, TLS, firewalls) to set up securely over the internet.
 
-- **How it works:** You deploy the background daemon (via Docker or Node) on a dedicated cloud VPS (like DigitalOcean, AWS, or a Raspberry Pi). You then point your Live Cursor settings to that `ws://` URL.
-- **Simplicity:** The plugin natively generates standard Docker Compose templates for you under the "Advanced Developer Settings" if you want to self-host.
-- **Limitations:** Requires technical knowledge to deploy a cloud server, setup DNS, and manage SSL/TLS if you want secure web-socket (`wss://`) traffic.
+### 3. WebRTC P2P (Mobile friendly)
+
+**Status: Not implemented yet.** Planned as a future connection mode that would let devices sync peer-to-peer without any server, ideal for mobile. Follow the repository to know when it lands.
 
 ---
 
-## Features
+## Security Notes
 
-- **Real-Time Cursor Tracking**: View the live cursors and text selections of other vault editors inside your notes with custom user profiles and dynamic hex colors.
-- **Config Sync Engine**: One-click bidirectional synchronization of settings, themes, and community plugins (your `.obsidian` configuration folder). Handles file conflicts gracefully by moving conflicted copies into a designated `Sync Conflicts/` folder while preserving directory structures.
-- **Admin Diagnostics**: Secure telemetry dashboard reporting uptime, connected rooms, memory utilization, and local SQLite/event-log database sizes (available on dedicated cloud instances).
-- **Zero-Conflict JSON Merge**: Automatically attempts to deep-merge standard plugin configurations before falling back to manual review.
+- The server is protected by a shared password (`AUTH_TOKEN` on the server, "Server Password" in the plugin settings). All devices must use the same password.
+- The default password is `default-pass` — **change it** before connecting devices to anything other than your own localhost server.
+- The local HTTP API and WebSocket connection both require the password. Connections with the wrong password are rejected.
+- Traffic between devices and the server is not encrypted. For internet deployments, put the server behind TLS (e.g., a reverse proxy like Caddy or Nginx) and use `wss://` / `https://` URLs.
 
 ---
 
-## Submitting to the Obsidian Community Plugins Tab
+## Setup (From Source)
 
-To make this plugin downloadable directly from the official Community Plugins catalog inside Obsidian, follow these steps:
+### 1. Install dependencies
 
-### 1. Build and Release
-Compile the plugin code locally:
+```bash
+npm install
+```
+
+This is required before building — the build tool (esbuild) is installed as a dev dependency.
+
+### 2. Build the plugin
+
 ```bash
 npm run build
 ```
-This updates `main.js` and compiles the background daemon launcher. 
 
-Create a new Release in your GitHub repository (`Live-Cursor/Live-Cursor`):
-- Name the release exactly matching your version in `manifest.json` (e.g. `1.0.0`).
-- Attach the following three compiled files as assets to the GitHub Release:
-  1. `main.js`
-  2. `manifest.json`
-  3. `styles.css`
+This produces `main.js` in the plugin folder.
 
-### 2. Submit to Obsidian Releases
-1. Fork the official [obsidianmd/obsidian-releases](https://github.com/obsidianmd/obsidian-releases) repository on GitHub.
-2. Edit `community-plugins.json` inside your fork and append your plugin configuration object at the end:
-   ```json
-   {
-     "id": "live-cursor",
-     "name": "Live Cursor",
-     "author": "Live-Cursor Organization",
-     "description": "Real-time collaborative editing and cursor tracking for Obsidian notes.",
-     "repo": "Live-Cursor/Live-Cursor"
-   }
-   ```
-3. Commit the change and submit a Pull Request to the `obsidian-releases` repository. The Obsidian development team will automatically review, verify compliance, and add it to the live catalog!
+### 3. Install the plugin into Obsidian
+
+Obsidian loads plugins from your vault's plugin directory:
+
+```
+<your vault>/.obsidian/plugins/live-cursor/
+```
+
+Copy these files into that directory:
+
+- `main.js`
+- `manifest.json`
+
+(You can also copy `styles.css` if one is generated later.) Then restart Obsidian and enable "Live Cursor" in Settings -> Community Plugins.
+
+### 4. Run the server
+
+- **Local:** Open Settings -> Live Cursor and click "Start Local Server". Your PC is now the host on port `4444`.
+- **Cloud (Docker):**
+
+```bash
+docker build -t live-cursor-server .
+docker run -d -p 4444:4444 -e AUTH_TOKEN=your-strong-password -v live-cursor-data:/app/data live-cursor-server
+```
+
+### 5. Connect devices
+
+On every device (including the host):
+
+- **Server Connection URL**: `ws://YOUR_PC_IP:4444` (or your cloud `wss://` URL)
+- **Room Name**: the exact same on all devices
+- **Server Password**: the exact same on all devices
+
+Open the same note on two devices and start typing — cursors and edits sync in real time.
+
+---
+
+## Architecture
+
+Live Cursor is built on two channels:
+
+1. **Yjs WebSocket sync** (`y-websocket` + `y-codemirror.next`) — real-time collaborative editing and cursor awareness per note.
+2. **HTTP sync API** (`server.js`) — whole-vault file and configuration synchronization (manifest comparison, upload/download, CRDT conflict resolution, JSON deep merge).
+
+The server persists Yjs room state to disk (`data/rooms/`) so documents survive restarts. The client keeps a pending-deletion queue so files deleted while offline are not resurrected after the server becomes reachable again.
 
 ---
 
 ## License
 
-This project is licensed under the MIT License.
+This project is licensed under the MIT License. Free, open source, for everyone.

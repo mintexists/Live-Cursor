@@ -13,6 +13,23 @@ if you want to view the source, please visit the github repository of this plugi
 
 const prod = (process.argv[2] === "production");
 
+// Self-contained bundle of the sync server (ws + yjs + y-websocket) so the
+// plugin can spawn it from a vault's plugin folder without any node_modules.
+const buildServerBundle = async () => {
+	await esbuild.build({
+		banner: {
+			js: banner,
+		},
+		entryPoints: ["server.js"],
+		bundle: true,
+		platform: "node",
+		format: "cjs",
+		target: "node20",
+		logLevel: "info",
+		outfile: "server.bundle.js",
+	});
+};
+
 const context = await esbuild.context({
 	banner: {
 		js: banner,
@@ -67,6 +84,7 @@ const context = await esbuild.context({
 
 if (prod) {
 	await context.rebuild();
+	await buildServerBundle();
 	process.exit(0);
 } else {
 	await context.watch();

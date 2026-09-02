@@ -39,6 +39,7 @@ jobs:
           files: |
             main.js
             manifest.json
+            server.bundle.js
           tag_name: ${{ github.ref_name }}
           name: Release ${{ github.ref_name }}
           body_path: ReleaseNotes.md

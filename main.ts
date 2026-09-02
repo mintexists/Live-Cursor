@@ -1,4 +1,4 @@
-import { App, Plugin, PluginSettingTab, Setting, TFile, WorkspaceLeaf, MarkdownView, Notice, debounce, requestUrl } from 'obsidian';
+import { App, Plugin, PluginSettingTab, Setting, TFile, WorkspaceLeaf, MarkdownView, Notice, debounce } from 'obsidian';
 import * as Y from 'yjs';
 import * as diff from 'diff';
 import { Awareness } from 'y-protocols/awareness';
@@ -8,46 +8,38 @@ import { Compartment, StateEffect } from '@codemirror/state';
 import { collaborationExtension } from './collabExtension';
 import { reconcileYText } from './reconcile';
 import { ConfigSyncEngine } from './configSync';
+import { normalizeServerUrl } from './utils';
 
 // Electron/Node APIs — only available on desktop
 declare const require: (module: string) => any;
-
-export function normalizeServerUrl(url: string): string {
-  let cleaned = (url || '').trim();
-  if (!cleaned) return 'ws://localhost:4444';
-
-  // 1. If it has no protocol, prepend 'ws://'
-  if (!/^https?:\/\//i.test(cleaned) && !/^wss?:\/\//i.test(cleaned)) {
-    cleaned = 'ws://' + cleaned;
-  }
-
-  // 2. Map http:// -> ws:// and https:// -> wss://
-  if (/^http:\/\//i.test(cleaned)) {
-    cleaned = cleaned.replace(/^http:\/\//i, 'ws://');
-  } else if (/^https:\/\//i.test(cleaned)) {
-    cleaned = cleaned.replace(/^https:\/\//i, 'wss://');
-  }
-
-  // 3. Remove trailing slashes and '/sync' path suffix
-  cleaned = cleaned.replace(/\/+$/, '');
-  cleaned = cleaned.replace(/\/sync\/?$/i, '');
-  cleaned = cleaned.replace(/\/+$/, '');
-
-  return cleaned;
-}
 
 interface LiveCursorSettings {
   nickname: string;
   cursorColor: string;
   roomName: string;
   signalingUrl: string;
+  authToken: string;
 }
 
 const DEFAULT_SETTINGS: LiveCursorSettings = {
   nickname: 'Me',
   cursorColor: '#6366f1',
   roomName: 'default-live-cursor-room',
-  signalingUrl: 'ws://localhost:4444'
+  signalingUrl: 'ws://localhost:4444',
+  authToken: 'default-pass'
+}
+
+/**
+ * Union-merge of two text fragments: keeps shared prefix/suffix once and
+ * combines the divergent middles so no text is lost and nothing is duplicated.
+ */
+function unionMerge(a: string, b: string): string {
+  let start = 0;
+  while (start < a.length && start < b.length && a.charAt(start) === b.charAt(start)) start++;
+  let aEnd = a.length;
+  let bEnd = b.length;
+  while (aEnd > start && bEnd > start && a.charAt(aEnd - 1) === b.charAt(bEnd - 1)) { aEnd--; bEnd--; }
+  return a.substring(0, start) + a.substring(start, aEnd) + b.substring(start, bEnd) + a.substring(aEnd);
 }
 
 type ConnectionStatus = 'connected' | 'connecting' | 'disconnected';
@@ -63,6 +55,8 @@ export default class LiveCursorPlugin extends Plugin {
   private retryTimeouts: Map<string, ReturnType<typeof setTimeout>> = new Map();
   private settingsTab: LiveCursorSettingTab | null = null;
   public configSyncEngine: ConfigSyncEngine | null = null;
+  private pendingDeletions: Set<string> = new Set();
+  public reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
   async onload() {
     await this.loadSettings();
@@ -74,11 +68,13 @@ export default class LiveCursorPlugin extends Plugin {
     this.configSyncEngine = new ConfigSyncEngine(
       this.app,
       serverUrl,
-      this.settings.nickname, // Basic auth placeholder
-      'default-pass',
+      this.settings.nickname,
+      this.settings.authToken,
       this.settings.roomName, // Using room name as workspace name
-      this.settings.nickname
+      this.settings.nickname,
+      () => { this.saveSettings(); }
     );
+    this.configSyncEngine.loadPendingDeletions([...this.pendingDeletions]);
 
     // Start local server automatically on desktop if configured for localhost
     if (this.isDesktop()) {
@@ -168,23 +164,24 @@ export default class LiveCursorPlugin extends Plugin {
     // Sync disk changes back into Yjs
     this.registerEvent(
       this.app.vault.on('modify', (file) => {
-        if (file instanceof TFile) {
-          let debouncer = this.diskDebouncers.get(file.path);
-          if (!debouncer) {
-            debouncer = debounce(async (f: TFile) => {
-              const sync = this.activeSyncs.get(f.path);
-              if (sync) {
-                const diskContent = await this.app.vault.read(f);
-                const currentYText = sync.doc.getText('content');
-                if (currentYText.toString() !== diskContent) {
-                  reconcileYText(currentYText, diskContent);
-                }
+        // Only track files that are currently being collab-synced;
+        // everything else is handled by the background vault sync.
+        if (!(file instanceof TFile) || !this.activeSyncs.has(file.path)) return;
+        let debouncer = this.diskDebouncers.get(file.path);
+        if (!debouncer) {
+          debouncer = debounce(async (f: TFile) => {
+            const sync = this.activeSyncs.get(f.path);
+            if (sync) {
+              const diskContent = await this.app.vault.read(f);
+              const currentYText = sync.doc.getText('content');
+              if (currentYText.toString() !== diskContent) {
+                reconcileYText(currentYText, diskContent);
               }
-            }, 50, true);
-            this.diskDebouncers.set(file.path, debouncer);
-          }
-          debouncer(file);
+            }
+          }, 50, true);
+          this.diskDebouncers.set(file.path, debouncer);
         }
+        debouncer(file);
       })
     );
 
@@ -205,8 +202,8 @@ export default class LiveCursorPlugin extends Plugin {
     );
     this.registerEvent(this.app.vault.on('create', () => backgroundSyncDebouncer()));
     this.registerEvent(this.app.vault.on('delete', (file) => {
-      if (this.configSyncEngine && file instanceof TFile) {
-        this.configSyncEngine.deleteRemoteFile(file.path);
+      if (file instanceof TFile && this.configSyncEngine) {
+        this.configSyncEngine.enqueueDeletion(file.path);
       }
       backgroundSyncDebouncer();
     }));
@@ -252,13 +249,17 @@ export default class LiveCursorPlugin extends Plugin {
     try {
       const { spawn } = require('child_process');
       const path = require('path');
+      const fs = require('fs');
 
-      // Find the plugin folder — server.js lives alongside main.js
+      // Find the plugin folder — the server bundle lives alongside main.js
       const pluginDir = (this.app.vault.adapter as any).getBasePath
         ? path.join((this.app.vault.adapter as any).getBasePath(), '.obsidian', 'plugins', 'live-cursor')
         : (this.manifest as any).dir || '';
 
-      const serverPath = path.join(pluginDir, 'server.js');
+      // Prefer the self-contained esbuild bundle (no npm deps needed in the
+      // plugin folder); fall back to server.js for source checkouts.
+      const bundlePath = path.join(pluginDir, 'server.bundle.js');
+      const serverPath = fs.existsSync(bundlePath) ? bundlePath : path.join(pluginDir, 'server.js');
       console.log(`[LiveCursor] Starting server at: ${serverPath}`);
 
       this.serverProcess = spawn('node', [serverPath], {
@@ -276,7 +277,7 @@ export default class LiveCursorPlugin extends Plugin {
 
       this.serverProcess.on('error', (err: Error) => {
         console.error('[LiveCursor] Failed to start server:', err);
-        new Notice(`❌ Failed to start server: ${err.message}`);
+        new Notice(`Failed to start server: ${err.message}`);
         this.serverProcess = null;
         this.settingsTab?.display();
       });
@@ -290,31 +291,31 @@ export default class LiveCursorPlugin extends Plugin {
 
       // Give it a moment to start, then reconnect
       setTimeout(() => {
-        if (!silent) new Notice('🟢 Local server started on port 4444. Connecting...');
+        if (!silent) new Notice('Local server started on port 4444. Connecting...');
         this.settingsTab?.display();
         this.reconnectAll();
       }, 1500);
 
     } catch (err: any) {
       console.error('[LiveCursor] Cannot start server:', err);
-      new Notice(`❌ Cannot start server: ${err.message}`);
+      new Notice(`Cannot start server: ${err.message}`);
     }
   }
 
-  stopLocalServer(): void {
+  stopLocalServer(silent: boolean = false): void {
     if (!this.serverProcess) {
-      new Notice('No local server is running.');
+      if (!silent) new Notice('No local server is running.');
       return;
     }
     try {
       this.serverProcess.kill();
       this.serverProcess = null;
-      new Notice('⏹ Local server stopped.');
+      if (!silent) new Notice('Local server stopped.');
       this.settingsTab?.display();
       this.updateStatusBar();
     } catch (err: any) {
       console.error('[LiveCursor] Failed to stop server:', err);
-      new Notice(`❌ Failed to stop server: ${err.message}`);
+      new Notice(`Failed to stop server: ${err.message}`);
     }
   }
 
@@ -350,7 +351,7 @@ export default class LiveCursorPlugin extends Plugin {
     }
 
     try {
-      new Notice('🔄 Resetting and reconstructing server database rooms...', 3000);
+      new Notice('Resetting and reconstructing server database rooms...', 3000);
 
       // 1. Disconnect and clear all active docs locally
       for (const [path, sync] of this.activeSyncs.entries()) {
@@ -363,16 +364,10 @@ export default class LiveCursorPlugin extends Plugin {
       this.activeSyncs.clear();
       this.diskDebouncers.clear();
 
-      // 2. Call reconstruct API on server
-      const url = `${this.configSyncEngine.serverUrl.trim()}/api/reconstruct-db?user=${this.settings.nickname}&workspace=${this.settings.roomName}`;
-      let httpUrl = url.replace(/^ws/i, 'http');
-      const res = await requestUrl({ url: httpUrl, method: 'POST' });
+      // 2. Call reconstruct API on server (scoped to the current workspace)
+      await this.configSyncEngine.reconstructDatabase();
 
-      if (res.status !== 200) {
-        throw new Error(`Server returned HTTP ${res.status}: ${res.text || 'No response body'}`);
-      }
-
-      new Notice('🧹 Server memory cleared. Re-uploading all files as source of truth...', 3500);
+      new Notice('Server memory cleared. Re-uploading all files as source of truth...', 3500);
 
       // 3. Force full vault config and note re-upload!
       await this.configSyncEngine.syncConfig(false);
@@ -380,10 +375,10 @@ export default class LiveCursorPlugin extends Plugin {
       // 4. Reconnect active workspace leaves
       this.reconnectAll();
 
-      new Notice('✅ Database successfully reconstructed! All devices connected.', 4000);
+      new Notice('Database successfully reconstructed! All devices connected.', 4000);
     } catch (err: any) {
       console.error('[LiveCursor] Database reconstruction failed:', err);
-      new Notice(`❌ Database reconstruction failed: ${err.message || err}`, 5000);
+      new Notice(`Database reconstruction failed: ${err.message || err}`, 5000);
     }
   }
 
@@ -409,13 +404,31 @@ export default class LiveCursorPlugin extends Plugin {
             continue;
           }
 
-          // Automatic CRDT-style additive merge (no git markers)
+          // Automatic CRDT-style additive merge (no git markers).
+          // Removed/added fragments of the same change block are union-merged
+          // so shared text is kept once and no content is lost or duplicated.
           const diffs = diff.diffWordsWithSpace(baseContent, conflictContent);
           let mergedContent = "";
+          let blockRemoved = "";
+          let blockAdded = "";
+          const flushBlock = () => {
+            if (blockRemoved || blockAdded) {
+              mergedContent += unionMerge(blockRemoved, blockAdded);
+              blockRemoved = "";
+              blockAdded = "";
+            }
+          };
           for (const part of diffs) {
-            // Keep all text from both versions (CRDT union behavior)
-            mergedContent += part.value;
+            if (part.removed) {
+              blockRemoved += part.value;
+            } else if (part.added) {
+              blockAdded += part.value;
+            } else {
+              flushBlock();
+              mergedContent += part.value;
+            }
           }
+          flushBlock();
 
           await this.app.vault.modify(baseFile, mergedContent);
           await this.app.vault.trash(file, true);
@@ -424,7 +437,7 @@ export default class LiveCursorPlugin extends Plugin {
       }
     }
 
-    new Notice(`✅ Merged and cleaned up ${mergedCount} conflict files!`);
+    new Notice(`Merged and cleaned up ${mergedCount} conflict files!`);
   }
 
   onunload() {
@@ -444,7 +457,7 @@ export default class LiveCursorPlugin extends Plugin {
     }
     this.activeSyncs.clear();
 
-    this.stopLocalServer();
+    this.stopLocalServer(true);
   }
 
   // ─────────────────────────────────────────────
@@ -544,10 +557,19 @@ export default class LiveCursorPlugin extends Plugin {
       colorLight: this.settings.cursorColor + '33'
     });
 
-    const fileRoomName = `${this.settings.roomName}-${encodeURIComponent(file.path)}`;
+    const fileRoomName = `${encodeURIComponent(this.settings.roomName)}/${encodeURIComponent(file.path)}`;
     const serverUrl = normalizeServerUrl(this.settings.signalingUrl);
 
-    const provider = new WebsocketProvider(serverUrl, fileRoomName, doc, { awareness });
+    const provider = new WebsocketProvider(serverUrl, fileRoomName, doc, {
+      awareness,
+      params: { token: this.settings.authToken }
+    });
+
+    // Disable y-websocket's built-in unlimited retry loop (it reconnects every
+    // ~0.5-2.5s forever, which fights our own scheduleRetry below and keeps the
+    // status stuck in an infinite connecting/disconnected cycle). Our capped
+    // backoff (5 attempts, then a Notice) drives reconnection instead.
+    provider.shouldConnect = false;
 
     const sync = { doc, awareness, provider };
     this.activeSyncs.set(file.path, sync);
@@ -561,7 +583,14 @@ export default class LiveCursorPlugin extends Plugin {
 
       const currentLocalContent = await this.app.vault.read(file);
       if (ytext.toString() === '') {
-        ytext.insert(0, currentLocalContent);
+        // Give concurrent peers a moment to push their state before claiming
+        // the doc with our local content, to avoid duplicate-paragraph races.
+        await new Promise((r) => setTimeout(r, 200));
+        if (ytext.toString() === '') {
+          ytext.insert(0, currentLocalContent);
+        } else if (ytext.toString() !== currentLocalContent) {
+          reconcileYText(ytext, currentLocalContent);
+        }
       } else if (ytext.toString() !== currentLocalContent) {
         reconcileYText(ytext, currentLocalContent);
       }
@@ -604,6 +633,8 @@ export default class LiveCursorPlugin extends Plugin {
         this.connectionStatus = 'connecting';
       } else if (status === 'disconnected') {
         this.connectionStatus = 'disconnected';
+        // Cancel y-websocket's internal retry so only our capped backoff runs
+        sync.provider?.disconnect();
         this.scheduleRetry(file, fileRoomName, doc, awareness, 0);
         // If we fail to connect, initialize offline immediately
         initializeCollab();
@@ -628,12 +659,12 @@ export default class LiveCursorPlugin extends Plugin {
       const isLocal = url.includes('localhost') || url.includes('127.0.0.1');
       if (isLocal) {
         new Notice(
-          '⚠️ Live Cursor: Cannot connect to local server.\n' +
-          'Go to Settings → Live Cursor → click "▶ Start Local Server".',
+          'Live Cursor: Cannot connect to local server.\n' +
+          'Go to Settings -> Live Cursor -> click "Start Local Server".',
           8000
         );
       } else {
-        new Notice(`⚠️ Live Cursor: Cannot connect to ${url}. Check the server is running.`, 8000);
+        new Notice(`Live Cursor: Cannot connect to ${url}. Check the server is running.`, 8000);
       }
       return;
     }
@@ -662,7 +693,6 @@ export default class LiveCursorPlugin extends Plugin {
       this.simulatorInterval = null;
       new Notice('Collaborator simulation stopped.');
       this.updateStatusBar();
-
       for (const sync of this.activeSyncs.values()) {
         const mockClientId = 133742;
         sync.awareness.states.delete(mockClientId);
@@ -735,7 +765,7 @@ export default class LiveCursorPlugin extends Plugin {
     if (!this.statusBarItem) return;
 
     if (this.simulatorInterval) {
-      this.statusBarItem.setText('Live Cursor 🟣 Simulating');
+      this.statusBarItem.setText('Live Cursor | Simulating');
       return;
     }
 
@@ -748,13 +778,13 @@ export default class LiveCursorPlugin extends Plugin {
     }
 
     if (connected > 0) {
-      this.statusBarItem.setText(`Live Cursor 🟢 ${connected} synced`);
+      this.statusBarItem.setText(`Live Cursor | ${connected} synced`);
     } else if (connecting > 0) {
-      this.statusBarItem.setText('Live Cursor 🟡 Connecting...');
+      this.statusBarItem.setText('Live Cursor | Connecting...');
     } else if (this.activeSyncs.size > 0) {
-      this.statusBarItem.setText('Live Cursor 🔴 Disconnected');
+      this.statusBarItem.setText('Live Cursor | Disconnected');
     } else {
-      this.statusBarItem.setText('Live Cursor ⚪ Standby');
+      this.statusBarItem.setText('Live Cursor | Standby');
     }
   }
 
@@ -763,11 +793,16 @@ export default class LiveCursorPlugin extends Plugin {
   // ─────────────────────────────────────────────
 
   async loadSettings() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    const data = await this.loadData() as any;
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
+    this.pendingDeletions = new Set(Array.isArray(data?.pendingDeletions) ? data.pendingDeletions : []);
   }
 
   async saveSettings() {
-    await this.saveData(this.settings);
+    await this.saveData({
+      ...this.settings,
+      pendingDeletions: [...this.pendingDeletions]
+    });
   }
 }
 
@@ -801,13 +836,13 @@ class LiveCursorSettingTab extends PluginSettingTab {
     const tutorialCard = containerEl.createEl('div');
     tutorialCard.style.cssText = 'background: linear-gradient(135deg, rgba(99, 102, 241, 0.05) 0%, rgba(139, 92, 246, 0.05) 100%); border: 1px solid rgba(99, 102, 241, 0.22); border-radius: 12px; padding: 18px; margin-bottom: 24px; box-shadow: 0 4px 12px rgba(0,0,0,0.05);';
     tutorialCard.innerHTML = `
-      <h3 style="margin: 0 0 8px 0; color: var(--text-accent); font-size: 1.1em; display: flex; align-items: center; gap: 8px;">🎓 Quick-Start Collaboration Guide</h3>
+      <h3 style="margin: 0 0 8px 0; color: var(--text-accent); font-size: 1.1em; display: flex; align-items: center; gap: 8px;">Quick-Start Collaboration Guide</h3>
       <p style="margin: 0 0 14px 0; font-size: var(--font-ui-small); color: var(--text-muted); line-height: 1.45;">Follow these simple steps to start collaborating and syncing in real time:</p>
       
       <div style="display: flex; flex-direction: column; gap: 12px; font-size: var(--font-ui-small); line-height: 1.45;">
         <div style="display: flex; align-items: flex-start; gap: 10px;">
           <div style="background: var(--interactive-accent); color: white; border-radius: 50%; width: 20px; height: 20px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; font-weight: bold; font-size: 11px;">1</div>
-          <div><strong>Start Local Host (On PC)</strong>: Toggle the <strong>Local Server</strong> below to <span style="color: var(--text-success); font-weight: 600;">🟢 Running</span>. (Your PC acts as the secure host).</div>
+          <div><strong>Start Local Host (On PC)</strong>: Toggle the <strong>Local Server</strong> below to <span style="color: var(--text-success); font-weight: 600;">Running</span>. (Your PC acts as the host).</div>
         </div>
         
         <div style="display: flex; align-items: flex-start; gap: 10px;">
@@ -817,18 +852,18 @@ class LiveCursorSettingTab extends PluginSettingTab {
         
         <div style="display: flex; align-items: flex-start; gap: 10px;">
           <div style="background: var(--interactive-accent); color: white; border-radius: 50%; width: 20px; height: 20px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; font-weight: bold; font-size: 11px;">3</div>
-          <div><strong>Set Room Name</strong>: All devices collaborating together must use the exact same <strong>Room Name</strong> (e.g. <code>my-shared-room</code>).</div>
+          <div><strong>Set Room Name and Password</strong>: All devices must use the exact same <strong>Room Name</strong> (e.g. <code>my-shared-room</code>) and the same <strong>Server Password</strong>.</div>
         </div>
 
         <div style="display: flex; align-items: flex-start; gap: 10px;">
           <div style="background: var(--interactive-accent); color: white; border-radius: 50%; width: 20px; height: 20px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; font-weight: bold; font-size: 11px;">4</div>
-          <div><strong>Collaborate!</strong>: Open any markdown note and start typing! Remote cursors and highlight ranges will render in real time.</div>
+          <div><strong>Collaborate</strong>: Open any markdown note and start typing! Remote cursors and highlight ranges will render in real time.</div>
         </div>
       </div>
     `;
 
     // ── Section: Profile ──
-    containerEl.createEl('h3', { text: '👤 Your Profile', attr: { style: sectionHeaderStyle() } });
+    containerEl.createEl('h3', { text: 'Your Profile', attr: { style: sectionHeaderStyle() } });
 
     new Setting(containerEl)
       .setName('Collaborator Nickname')
@@ -852,7 +887,7 @@ class LiveCursorSettingTab extends PluginSettingTab {
         }));
 
     // ── Section: Active Collaborators ──
-    containerEl.createEl('h3', { text: '👥 Connected Collaborators', attr: { style: sectionHeaderStyle() } });
+    containerEl.createEl('h3', { text: 'Connected Collaborators', attr: { style: sectionHeaderStyle() } });
 
     const activeUsers = new Map<string, { name: string, color: string }>();
     for (const sync of this.plugin.activeSyncs.values()) {
@@ -888,7 +923,7 @@ class LiveCursorSettingTab extends PluginSettingTab {
     }
 
     // ── Section: Local Server ──
-    containerEl.createEl('h3', { text: '🖥️ Local Sync Server', attr: { style: sectionHeaderStyle() } });
+    containerEl.createEl('h3', { text: 'Local Sync Server', attr: { style: sectionHeaderStyle() } });
 
     // Server status indicator
     const statusEl = containerEl.createEl('div');
@@ -898,11 +933,11 @@ class LiveCursorSettingTab extends PluginSettingTab {
     if (isRunning) {
       statusEl.style.background = 'rgba(34, 197, 94, 0.12)';
       statusEl.style.border = '1px solid rgba(34, 197, 94, 0.3)';
-      statusEl.innerHTML = '<span style="font-size:16px">🟢</span> <span><strong>Server running</strong> on port 4444 — your devices can connect.</span>';
+      statusEl.innerHTML = '<span style="width:10px;height:10px;border-radius:50%;background:#22c55e;display:inline-block;"></span> <span><strong>Server running</strong> on port 4444 — your devices can connect.</span>';
     } else {
       statusEl.style.background = 'rgba(239, 68, 68, 0.1)';
       statusEl.style.border = '1px solid rgba(239, 68, 68, 0.25)';
-      statusEl.innerHTML = '<span style="font-size:16px">🔴</span> <span><strong>Server not running.</strong> Start it below to enable local sync.</span>';
+      statusEl.innerHTML = '<span style="width:10px;height:10px;border-radius:50%;background:#ef4444;display:inline-block;"></span> <span><strong>Server not running.</strong> Start it below to enable local sync.</span>';
     }
 
     // Server start/stop buttons
@@ -912,14 +947,14 @@ class LiveCursorSettingTab extends PluginSettingTab {
 
     if (!isRunning) {
       serverButtonSetting.addButton(btn => btn
-        .setButtonText('▶  Start Local Server')
+        .setButtonText('Start Local Server')
         .setCta()
         .onClick(async () => {
           await this.plugin.startLocalServer();
         }));
     } else {
       serverButtonSetting.addButton(btn => btn
-        .setButtonText('⏹  Stop Server')
+        .setButtonText('Stop Server')
         .setWarning()
         .onClick(() => {
           this.plugin.stopLocalServer();
@@ -930,14 +965,22 @@ class LiveCursorSettingTab extends PluginSettingTab {
     const ipHint = containerEl.createEl('div');
     ipHint.style.cssText = 'margin: 0 0 16px 0; padding: 10px 14px; background: var(--background-secondary); border-radius: 8px; font-size: var(--font-ui-small); color: var(--text-muted);';
     ipHint.innerHTML = `
-      <strong>📱 Connecting from mobile or another device?</strong><br>
+      <strong>Connecting from mobile or another device?</strong><br>
       Find your PC's local IP with <code>ipconfig</code> (Windows) or <code>ifconfig</code> (Mac/Linux),
       then set the server URL below to <code>ws://YOUR_PC_IP:4444</code> on all devices.<br>
       <span style="opacity:0.7">Example: <code>ws://192.168.1.12:4444</code></span>
     `;
 
     // ── Section: Connection ──
-    containerEl.createEl('h3', { text: '🔗 Connection & Room', attr: { style: sectionHeaderStyle() } });
+    containerEl.createEl('h3', { text: 'Connection & Room', attr: { style: sectionHeaderStyle() } });
+
+    const scheduleReconnect = () => {
+      if (this.plugin.reconnectTimer) clearTimeout(this.plugin.reconnectTimer);
+      this.plugin.reconnectTimer = setTimeout(() => {
+        this.plugin.reconnectAll();
+        new Notice('Reconnected with new settings.');
+      }, 600);
+    };
 
     new Setting(containerEl)
       .setName('Room Name')
@@ -951,6 +994,7 @@ class LiveCursorSettingTab extends PluginSettingTab {
             this.plugin.configSyncEngine.workspace = this.plugin.settings.roomName;
           }
           await this.plugin.saveSettings();
+          scheduleReconnect();
         }));
 
     new Setting(containerEl)
@@ -965,20 +1009,36 @@ class LiveCursorSettingTab extends PluginSettingTab {
             this.plugin.configSyncEngine.serverUrl = val || 'ws://localhost:4444';
           }
           await this.plugin.saveSettings();
+          scheduleReconnect();
         }));
+
+    new Setting(containerEl)
+      .setName('Server Password')
+      .setDesc('All devices must use the same password. The server rejects connections with the wrong password.')
+      .addText(text => {
+        text.inputEl.type = 'password';
+        text
+          .setPlaceholder('default-pass')
+          .setValue(this.plugin.settings.authToken)
+          .onChange(async (val: string) => {
+            this.plugin.settings.authToken = val || 'default-pass';
+            await this.plugin.saveSettings();
+            scheduleReconnect();
+          });
+      });
 
     new Setting(containerEl)
       .setName('Reconnect All Files')
       .setDesc('Force a reconnection to the server with current settings.')
       .addButton(btn => btn
-        .setButtonText('🔄 Reconnect')
+        .setButtonText('Reconnect')
         .onClick(() => {
           this.plugin.reconnectAll();
           new Notice('Reconnecting to server...');
         }));
 
     // ── Section: Full Vault Sync ──
-    containerEl.createEl('h3', { text: '📂 Full Vault Sync', attr: { style: sectionHeaderStyle() } });
+    containerEl.createEl('h3', { text: 'Full Vault Sync', attr: { style: sectionHeaderStyle() } });
     
     new Setting(containerEl)
       .setName('Sync Entire Vault Configurations')
@@ -995,16 +1055,16 @@ class LiveCursorSettingTab extends PluginSettingTab {
         }));
 
     // ── Section: Advanced Database Tools ──
-    containerEl.createEl('h3', { text: '🛠️ Advanced Database Tools', attr: { style: sectionHeaderStyle() } });
+    containerEl.createEl('h3', { text: 'Advanced Database Tools', attr: { style: sectionHeaderStyle() } });
 
     new Setting(containerEl)
       .setName('Reconstruct Server Database')
       .setDesc('Purges the server room-state binaries and reconstructs the server database using your current local notes as the source of truth. Use this to instantly resolve any persistent synchronization issues or phantom conflict files.')
       .addButton(btn => btn
-        .setButtonText('⚠️ Reconstruct Database')
+        .setButtonText('Reconstruct Database')
         .setWarning()
         .onClick(async () => {
-          const confirmReset = confirm('⚠️ Are you sure you want to reconstruct the server database?\n\nThis will purge all server-side document history binaries and recreate them from your current local files. Other connected devices will temporarily disconnect and automatically resync.');
+          const confirmReset = confirm('Are you sure you want to reconstruct the server database?\n\nThis will purge all server-side document history binaries and recreate them from your current local files. Other connected devices will temporarily disconnect and automatically resync.');
           if (confirmReset) {
             await this.plugin.reconstructDatabase();
           }

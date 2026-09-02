@@ -5,4 +5,5 @@ RUN npm install ws yjs y-websocket
 EXPOSE 4444
 ENV PORT=4444
 ENV DB_DIR=/app/data
+ENV AUTH_TOKEN=default-pass
 CMD ["node", "server.js"]

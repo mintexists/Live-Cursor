@@ -1,6 +1,7 @@
 import { App, requestUrl, Notice } from 'obsidian';
 import * as Y from 'yjs';
 import { reconcileYText } from './reconcile';
+import { getApiUrl } from './utils';
 
 export interface FileManifest {
   [filePath: string]: {
@@ -29,12 +30,12 @@ function deepMerge(target: any, source: any): any {
 }
 
 /**
- * Filter mechanism to ignore temporary, transient, or large system files that 
+ * Filter mechanism to ignore temporary, transient, or large system files that
  * cause conflict spam or should not be synced.
  */
 function shouldIgnore(path: string): boolean {
   const normalized = path.replace(/\\/g, '/');
-  
+
   // Ephemeral/System directories
   if (
     normalized.startsWith('.git/') || normalized === '.git' ||
@@ -45,8 +46,9 @@ function shouldIgnore(path: string): boolean {
     return true;
   }
 
-  // Plugin internal data (room state binaries, backups, etc.)
-  if (normalized.includes('.obsidian/plugins/live-cursor/data/')) {
+  // The plugin's own folder must never sync between devices:
+  // data.json, main.js, server.bundle.js, manifest.json would clobber each other.
+  if (normalized.includes('.obsidian/plugins/live-cursor')) {
     return true;
   }
 
@@ -69,6 +71,8 @@ function shouldIgnore(path: string): boolean {
 
 export class ConfigSyncEngine {
   private static isSyncing = false;
+  private pendingDeletions: Set<string> = new Set();
+  private persistPendingDeletions: () => void;
 
   constructor(
     private app: App,
@@ -76,70 +80,90 @@ export class ConfigSyncEngine {
     private user: string,
     private pass: string,
     public workspace: string = 'default-workspace',
-    private deviceName: string = 'Unknown Device'
-  ) {}
+    private deviceName: string = 'Unknown Device',
+    persistPendingDeletions?: () => void
+  ) {
+    this.persistPendingDeletions = persistPendingDeletions || (() => {});
+  }
 
-  private getApiUrl(endpoint: string): string {
-    let cleaned = this.serverUrl.trim();
-    if (!cleaned) cleaned = 'ws://localhost:4444';
+  public loadPendingDeletions(paths: string[]) {
+    this.pendingDeletions = new Set(paths.filter(Boolean));
+  }
 
-    // 1. If it has no protocol, prepend 'ws://'
-    if (!/^https?:\/\//i.test(cleaned) && !/^wss?:\/\//i.test(cleaned)) {
-      cleaned = 'ws://' + cleaned;
-    }
+  public getPendingDeletionPaths(): string[] {
+    return [...this.pendingDeletions];
+  }
 
-    // 2. Map http:// -> ws:// and https:// -> wss://
-    if (/^http:\/\//i.test(cleaned)) {
-      cleaned = cleaned.replace(/^http:\/\//i, 'ws://');
-    } else if (/^https:\/\//i.test(cleaned)) {
-      cleaned = cleaned.replace(/^https:\/\//i, 'wss://');
-    }
-
-    // 3. Remove trailing slashes and '/sync' path suffix
-    cleaned = cleaned.replace(/\/+$/, '');
-    cleaned = cleaned.replace(/\/sync\/?$/i, '');
-    cleaned = cleaned.replace(/\/+$/, '');
-
-    let httpUrl = cleaned.replace(/^ws/i, 'http');
-    return `${httpUrl}/api${endpoint}`;
+  private authHeaders(): Record<string, string> {
+    return { Authorization: `Bearer ${this.pass}` };
   }
 
   private async getRemoteManifest(): Promise<FileManifest> {
-    const url = `${this.getApiUrl('/manifest')}?user=${this.user}&pass=${this.pass}&workspace=${this.workspace}`;
-    const res = await requestUrl({ url, method: 'GET' });
+    const url = `${getApiUrl(this.serverUrl, '/manifest')}?workspace=${encodeURIComponent(this.workspace)}`;
+    const res = await requestUrl({ url, method: 'GET', headers: this.authHeaders() });
     if (res.status !== 200) throw new Error(`Server returned HTTP ${res.status}: ${res.text || 'No response body'}`);
     return res.json as FileManifest;
   }
 
   private async uploadFile(relativePath: string, data: ArrayBuffer, mtime: number) {
-    const url = `${this.getApiUrl('/upload')}?user=${this.user}&pass=${this.pass}&workspace=${this.workspace}&path=${encodeURIComponent(relativePath)}&mtime=${mtime}`;
+    const url = `${getApiUrl(this.serverUrl, '/upload')}?workspace=${encodeURIComponent(this.workspace)}&path=${encodeURIComponent(relativePath)}&mtime=${mtime}`;
     const res = await requestUrl({
       url,
       method: 'POST',
       body: data,
+      headers: this.authHeaders(),
     });
     if (res.status !== 200) throw new Error(`Upload failed: ${res.text}`);
   }
 
   private async downloadFile(relativePath: string): Promise<ArrayBuffer> {
-    const url = `${this.getApiUrl('/download')}?user=${this.user}&pass=${this.pass}&workspace=${this.workspace}&path=${encodeURIComponent(relativePath)}`;
-    const res = await requestUrl({ url, method: 'GET' });
+    const url = `${getApiUrl(this.serverUrl, '/download')}?workspace=${encodeURIComponent(this.workspace)}&path=${encodeURIComponent(relativePath)}`;
+    const res = await requestUrl({ url, method: 'GET', headers: this.authHeaders() });
     if (res.status !== 200) throw new Error('Download failed');
     return res.arrayBuffer;
   }
 
-  public async deleteRemoteFile(relativePath: string) {
+  /**
+   * Registers a file for remote deletion. Deletions are retried on every sync
+   * until the server confirms, so files deleted while offline are not resurrected.
+   */
+  public async enqueueDeletion(relativePath: string) {
     if (shouldIgnore(relativePath)) return;
-    try {
-      const url = `${this.getApiUrl('/delete')}?user=${this.user}&pass=${this.pass}&workspace=${this.workspace}&path=${encodeURIComponent(relativePath)}`;
-      await requestUrl({ url, method: 'DELETE' });
-    } catch (e) {
-      console.warn(`[LiveCursor] Failed to delete remote file ${relativePath}:`, e);
+    this.pendingDeletions.add(relativePath);
+    this.persistPendingDeletions();
+    await this.flushPendingDeletions();
+  }
+
+  private async flushPendingDeletions(): Promise<void> {
+    if (this.pendingDeletions.size === 0) return;
+
+    for (const relPath of [...this.pendingDeletions]) {
+      try {
+        const url = `${getApiUrl(this.serverUrl, '/delete')}?workspace=${encodeURIComponent(this.workspace)}&path=${encodeURIComponent(relPath)}`;
+        const res = await requestUrl({ url, method: 'DELETE', headers: this.authHeaders() });
+        if (res.status === 200 || res.status === 404) {
+          this.pendingDeletions.delete(relPath);
+        }
+      } catch (e) {
+        console.warn(`[LiveCursor] Failed to delete remote file ${relPath} (will retry):`, e);
+      }
+    }
+    this.persistPendingDeletions();
+  }
+
+  /**
+   * Purges the server's room-state database for the current workspace only.
+   */
+  public async reconstructDatabase(): Promise<void> {
+    const url = `${getApiUrl(this.serverUrl, '/reconstruct-db')}?workspace=${encodeURIComponent(this.workspace)}`;
+    const res = await requestUrl({ url, method: 'POST', headers: this.authHeaders() });
+    if (res.status !== 200) {
+      throw new Error(`Server returned HTTP ${res.status}: ${res.text || 'No response body'}`);
     }
   }
 
   /**
-   * Writes binary data directly to the Obsidian vault using low-level adapter APIs 
+   * Writes binary data directly to the Obsidian vault using low-level adapter APIs
    * to bypass standard hidden-file limitations of app.vault.
    */
   private async writeToVaultUI(relPath: string, data: ArrayBuffer) {
@@ -173,8 +197,8 @@ export class ConfigSyncEngine {
   }
 
   /**
-   * Performs an incremental, database-free whole-vault configuration and file sync.
-   * Compares the local file system manifest with the server manifest, pushing and pulling 
+   * Performs an incremental whole-vault configuration and file sync.
+   * Compares the local file system manifest with the server manifest, pushing and pulling
    * updates as needed, and resolving conflicts automatically.
    */
   public async syncConfig(silent: boolean = false) {
@@ -186,6 +210,9 @@ export class ConfigSyncEngine {
     if (!silent) new Notice('Syncing vault files...', 2000);
 
     try {
+      // Retry any deletions that failed while the server was unreachable
+      await this.flushPendingDeletions();
+
       const remoteManifest = await this.getRemoteManifest();
       const localFiles: { path: string, stat: any }[] = [];
 
@@ -231,6 +258,12 @@ export class ConfigSyncEngine {
           await this.uploadFile(relPath, data, local.stat.mtime);
           actionsCount++;
         } else if (!local && remote) {
+          if (this.pendingDeletions.has(relPath)) {
+            // We deleted this file locally but the server delete hasn't confirmed yet;
+            // don't pull it back down. Retry the deletion instead.
+            await this.flushPendingDeletions();
+            continue;
+          }
           // File exists only remotely -> Download
           await this.ensureDirExists(relPath, '');
           const data = await this.downloadFile(relPath);
@@ -239,7 +272,7 @@ export class ConfigSyncEngine {
         } else if (local && remote) {
           // File exists in both -> Check for modification differences
           const timeDiff = Math.abs(local.stat.mtime - remote.mtime);
-          
+
           if (timeDiff > 2000) {
             // Contents or timestamps differ. Let's read both.
             const localData = await this.app.vault.adapter.readBinary(local.path);
@@ -268,14 +301,14 @@ export class ConfigSyncEngine {
             } else {
               // Conflict: Contents are different and timestamps differ.
               if (relPath.endsWith('.md')) {
-                // ELEGANT AUTOMATIC CRDT NOTE MERGE!
+                // Automatic CRDT note merge
                 try {
                   console.log(`[LiveCursor] Automatically merging CRDT conflict for note: ${relPath}`);
-                  
+
                   // 1. Fetch the server's Yjs room state binary update
-                  const urlGet = `${this.getApiUrl('/room-state')}?user=${this.user}&pass=${this.pass}&workspace=${this.workspace}&path=${encodeURIComponent(relPath)}`;
-                  const resGet = await requestUrl({ url: urlGet, method: 'GET' });
-                  
+                  const urlGet = `${getApiUrl(this.serverUrl, '/room-state')}?workspace=${encodeURIComponent(this.workspace)}&path=${encodeURIComponent(relPath)}`;
+                  const resGet = await requestUrl({ url: urlGet, method: 'GET', headers: this.authHeaders() });
+
                   const doc = new Y.Doc();
                   if (resGet.status === 200 && resGet.arrayBuffer.byteLength > 0) {
                     Y.applyUpdate(doc, new Uint8Array(resGet.arrayBuffer));
@@ -287,13 +320,13 @@ export class ConfigSyncEngine {
 
                   // 3. Reconcile the Yjs document with our local offline edits
                   const ytext = doc.getText('content');
-                  
+
                   // If the Yjs doc was empty, initialize it with the remote content first
                   if (ytext.toString() === '') {
                     const remoteText = decoder.decode(new Uint8Array(remoteData));
                     ytext.insert(0, remoteText);
                   }
-                  
+
                   // Reconcile with local text to merge offline edits cleanly
                   reconcileYText(ytext, localText);
 
@@ -301,11 +334,12 @@ export class ConfigSyncEngine {
                   const mergedUpdate = Y.encodeStateAsUpdate(doc);
 
                   // 5. Send the merged update back to the server
-                  const urlPost = `${this.getApiUrl('/room-state')}?user=${this.user}&pass=${this.pass}&workspace=${this.workspace}&path=${encodeURIComponent(relPath)}`;
+                  const urlPost = `${getApiUrl(this.serverUrl, '/room-state')}?workspace=${encodeURIComponent(this.workspace)}&path=${encodeURIComponent(relPath)}`;
                   const resPost = await requestUrl({
                     url: urlPost,
                     method: 'POST',
-                    body: mergedUpdate.buffer,
+                    body: mergedUpdate.buffer as ArrayBuffer,
+                    headers: this.authHeaders(),
                   });
 
                   if (resPost.status !== 200) throw new Error(`CRDT Merge POST failed: ${resPost.text}`);
@@ -313,7 +347,7 @@ export class ConfigSyncEngine {
                   // 6. Write the merged text back to our local disk file
                   const mergedText = ytext.toString();
                   const encoder = new TextEncoder();
-                  await this.writeToVaultUI(relPath, encoder.encode(mergedText).buffer);
+                  await this.writeToVaultUI(relPath, encoder.encode(mergedText).buffer as ArrayBuffer);
 
                   actionsCount++;
                   console.log(`[LiveCursor] CRDT merge successful for note: ${relPath}`);
@@ -328,7 +362,7 @@ export class ConfigSyncEngine {
                   actionsCount++;
                 }
               } else if (relPath.endsWith('.json')) {
-                // Elegant automatic JSON merge
+                // Automatic JSON merge
                 try {
                   const decoder = new TextDecoder('utf-8');
                   const encoder = new TextEncoder();
@@ -338,7 +372,7 @@ export class ConfigSyncEngine {
 
                   const mergedJson = deepMerge(localJson, remoteJson);
                   const mergedData = encoder.encode(JSON.stringify(mergedJson, null, 2)).buffer;
-                  
+
                   const mergedMtime = Math.max(local.stat.mtime, remote.mtime);
 
                   // Save merged file locally and upload to remote
