@@ -1,6 +1,7 @@
 name: Release Sync Server to GHCR
 
 on:
+  workflow_run:
   push:
     branches:
       - main
